@@ -27,8 +27,5 @@ pub fn build(b: *std.Build) void {
         .linkage = .dynamic,
         .root_module = patch,
     });
-    dll.image_base = 0x2876_0000;
-    dll.linker_dynamicbase = false;
-    dll.pie = false;
     b.installArtifact(dll);
 }

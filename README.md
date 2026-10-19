@@ -15,9 +15,9 @@ and objdump.
 
 ## How it works!
 
-The `TMCompPatch.dll` uses the DirectInput proxy to load and initializes
-under the Windows loader lock, like the original 1.5.1 patch. It then validates
-its image base, the PE metadata, and all of the hook sites.
+The `TMCompPatch.dll` uses the DirectInput proxy to load and initializes a
+worker thread. It when validates its image base, the PE metadata, and all
+of the hook sites.
 
 Then 5 DirectInput methods are hooked: `Acquire`, `Unacquire`, `Poll`,
 `GetDeviceState`, and `GetDeviceData`. Alternate Method uses Raw Input

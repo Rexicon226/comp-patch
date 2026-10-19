@@ -407,13 +407,16 @@ var hook_table_count: usize = 0;
 var game_window: ?w.HWND = null;
 var previous_window_proc: ?w.WNDPROC = null;
 var title_applied: bool = false;
-var raw_setup_attempted: bool = false;
 
-// The original patch shared these maps and queues without synchronization.
+// Lock and return the shared recorder state.
 fn lockState() *PatchState {
+    w.EnterCriticalSection(&critical);
     return patch_state.?;
 }
-fn unlockState() void {}
+// Release the shared recorder state.
+fn unlockState() void {
+    w.LeaveCriticalSection(&critical);
+}
 
 const GameError = error{
     NullGamePointer,
@@ -656,8 +659,10 @@ fn processRawInput(in: w.HRAWINPUT) void {
     else
         .unknown;
 
-    // The original ignored RAWHID.dwCount and consumed only report zero.
-    processHidReport(state, raw_handle, product_id, preparsed, packet[24..][0..report_size]);
+    for (0..report_count) |index| {
+        const start = 24 + @as(usize, report_size) * index;
+        processHidReport(state, raw_handle, product_id, preparsed, packet[start..][0..report_size]) catch {};
+    }
 }
 
 // Read the wall clock in 100-nanosecond FILETIME ticks.
@@ -840,33 +845,40 @@ fn registerRawInput(window: w.HWND) bool {
     return w.RegisterRawInputDevices(&devices, devices.len, @sizeOf(w.RAWINPUTDEVICE)) != w.FALSE;
 }
 
-// The original registered Raw Input first and ignored subclass failure.
+// Apply window features and activate Raw Input when requested by the game.
 fn updateWindowFeatures() void {
     const window = resolveGameWindow() catch return;
     applyWindowTitle(window);
-    if (raw_setup_attempted) return;
-
-    const state = lockState();
-    const should_register = state.alternate_requested and !state.raw_ready and !state.raw_failed;
-    unlockState();
-    if (!should_register) return;
-
-    raw_setup_attempted = true;
-    const registered = registerRawInput(window);
-    const updated = lockState();
-    if (registered) {
-        updated.raw_ready = true;
-        updated.window_active = true;
-    } else {
-        updated.raw_failed = true;
-        updated.alternate_requested = false;
-    }
-    unlockState();
-    if (!registered) {
-        fatal(.raw_input_failed);
+    if (!installWindowProc(window)) {
+        const failed = lockState();
+        const report_failure = failed.alternate_requested and !failed.raw_failed;
+        if (report_failure) {
+            failed.raw_failed = true;
+            failed.alternate_requested = false;
+        }
+        unlockState();
+        if (report_failure) fatal(.raw_input_failed);
         return;
     }
-    _ = installWindowProc(window);
+    {
+        const state = lockState();
+        defer unlockState();
+        const should_register = state.alternate_requested and !state.raw_ready and !state.raw_failed;
+        if (!should_register) return;
+    }
+    const registered = registerRawInput(window);
+    {
+        const updated = lockState();
+        defer unlockState();
+        if (registered) {
+            updated.raw_ready = true;
+            updated.window_active = true;
+        } else {
+            updated.raw_failed = true;
+            updated.alternate_requested = false;
+        }
+    }
+    if (!registered) fatal(.raw_input_failed);
 }
 
 // Resolve an action-history entry to its registered action name.
@@ -1074,7 +1086,7 @@ fn finalizeRecord(state: *PatchState, race: Address) (GameError || protocol.Buil
     }
 
     var iv: [16]u8 = undefined;
-    _ = w.SystemFunction036(@ptrCast(&iv), iv.len);
+    if (w.SystemFunction036(@ptrCast(&iv), iv.len) == 0) return;
     var local_time: w.SYSTEMTIME = undefined;
     w.GetLocalTime(&local_time);
 
@@ -1706,22 +1718,19 @@ fn finishCodeWrite(site: Address, length: usize, protection: w.PAGE_PROTECTION_F
     _ = w.FlushInstructionCache(w.GetCurrentProcess(), site.ptr(?*const anyopaque), length);
 }
 
-// Not a single ifence found anywhere!!
-
 fn installJump(site: FixedAddress, expected: []const u8, target: DetourFn) bool {
     if (expected.len < 5 or !bytesEqual(site, expected)) return false;
 
     var old: w.PAGE_PROTECTION_FLAGS = undefined;
-    _ = w.VirtualProtect(site.ptr(?*anyopaque), expected.len, .{ .PAGE_EXECUTE_READWRITE = 1 }, &old);
+    if (w.VirtualProtect(site.ptr(?*anyopaque), expected.len, .{ .PAGE_EXECUTE_READWRITE = 1 }, &old) == w.FALSE) return false;
 
     const relative: u32 = @truncate(@intFromPtr(target) -% @backingInt(site.add(5)));
     const destination = site.ptr([*]u8)[0..expected.len];
-    destination[0] = 0xe9;
+    destination[0] = 0xe9; // jmp rel16
     std.mem.writeInt(u32, destination[1..5], relative, .little);
-    if (destination.len > 5) @memset(destination[5..], 0x90);
+    if (destination.len > 5) @memset(destination[5..], 0x90); // nop pad
 
-    var ignored: w.PAGE_PROTECTION_FLAGS = undefined;
-    _ = w.VirtualProtect(site.ptr(?*anyopaque), expected.len, old, &ignored);
+    finishCodeWrite(site.address(), expected.len, old);
     return true;
 }
 
@@ -1729,11 +1738,10 @@ fn installNops(site: FixedAddress, expected: []const u8) bool {
     if (expected.len == 0 or !bytesEqual(site, expected)) return false;
 
     var old: w.PAGE_PROTECTION_FLAGS = undefined;
-    _ = w.VirtualProtect(site.ptr(?*anyopaque), expected.len, .{ .PAGE_EXECUTE_READWRITE = 1 }, &old);
+    if (w.VirtualProtect(site.ptr(?*anyopaque), expected.len, .{ .PAGE_EXECUTE_READWRITE = 1 }, &old) == w.FALSE) return false;
     @memset(site.ptr([*]u8)[0..expected.len], 0x90);
 
-    var ignored: w.PAGE_PROTECTION_FLAGS = undefined;
-    _ = w.VirtualProtect(site.ptr(?*anyopaque), expected.len, old, &ignored);
+    finishCodeWrite(site.address(), expected.len, old);
     return true;
 }
 
@@ -1793,21 +1801,28 @@ const GAME_HOOKS: [9]GameHook = .{
     // zig fmt: on
 };
 
-// There is a check for patch installation failed, but it would leave previous
-// ones enabled.
 fn installGameHooks() bool {
-    for (GAME_HOOKS) |hook| {
+    for (GAME_HOOKS, 0..) |hook, index| {
         const installed = if (hook.detour) |detour|
             installJump(hook.site, hook.original, detour)
         else
             installNops(hook.site, hook.original);
-        if (!installed) return false;
+        if (installed) continue;
+
+        var rollback = index;
+        while (rollback > 0) {
+            rollback -= 1;
+            const previous = GAME_HOOKS[rollback];
+            restoreBytes(previous.site, previous.original);
+        }
+        return false;
     }
     return true;
 }
 
 const FatalKind = enum {
     unsupported_game,
+    pin_failed,
     allocation_failed,
     direct_input_failed,
     detour_failed,
@@ -1817,13 +1832,13 @@ const FatalKind = enum {
 fn fatal(comptime kind: FatalKind) void {
     const text: [*:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral(switch (kind) {
         .unsupported_game => "Could not start: game executable not compatible with Competition Patch.",
+        .pin_failed => "Competition Patch could not initialize its module.",
         .allocation_failed => "Competition Patch could not allocate its replay state.",
         .direct_input_failed => "The competition patch could not hook DirectInput.",
         .detour_failed => "The competition patch could not install its game detours.",
         .raw_input_failed => "Could not detect devices. Toggle off the Alternate Method option in the game launcher if this problem persists.",
     });
     _ = w.MessageBoxW(null, text, std.unicode.utf8ToUtf16LeStringLiteral("Competition Patch Error"), w.MB_ICONERROR);
-    _ = w.TerminateProcess(w.GetCurrentProcess(), 1);
 }
 
 // Validate the process, allocate state, and install all hooks.
@@ -1831,6 +1846,12 @@ fn initialize(_: ?*anyopaque) callconv(.winapi) u32 {
     if (w.GetAsyncKeyState(@backingInt(w.VK_PAUSE)) != 0 or existingPatchMarker()) return 0;
     if (!validateGameImage()) {
         fatal(.unsupported_game);
+        return 0;
+    }
+    const address: [*:0]align(1) const u16 = @ptrCast(&initialize);
+    var pinned: ?w.HINSTANCE = undefined;
+    if (w.GetModuleHandleExW(0x0000_0001 | 0x0000_0004, address, &pinned) == w.FALSE) {
+        fatal(.pin_failed);
         return 0;
     }
     w.InitializeCriticalSection(&critical);
@@ -1842,22 +1863,26 @@ fn initialize(_: ?*anyopaque) callconv(.winapi) u32 {
     patch_state = @ptrCast(@alignCast(memory));
     patch_state.?.window_active = true;
     if (!installDirectInputHooks()) {
+        restoreDirectInputHooks();
         fatal(.direct_input_failed);
         return 0;
     }
     if (!installGameHooks()) {
+        restoreDirectInputHooks();
         fatal(.detour_failed);
         return 0;
     }
     return 0;
 }
 
-// The entire initialization is done under the loader lock??
+// Defer initialization until after the loader releases its lock.
 pub fn DllMain(instance: w.HINSTANCE, reason: u32, _: ?*anyopaque) callconv(.winapi) std.os.windows.BOOL {
     if (reason == w.DLL_PROCESS_ATTACH) {
         module = instance;
         _ = w.DisableThreadLibraryCalls(instance);
-        _ = initialize(null);
+        const thread = w.CreateThread(null, 0, &initialize, null, w.THREAD_CREATE_RUN_IMMEDIATELY, null);
+        if (thread == null) return .FALSE;
+        _ = w.CloseHandle(thread);
     }
     return .TRUE;
 }
