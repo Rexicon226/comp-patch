@@ -1,0 +1,13 @@
+.{
+    .name = .comp_patch,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .fingerprint = 0x24d7273850fe6c26,
+    .paths = .{""},
+    .dependencies = .{
+        .win32 = .{
+            .url = "git+https://github.com/marlersoft/zigwin32#fb2645891520f3e99931db17a7eba04057e87e89",
+            .hash = "win32-42.0.39-preview-mX5pFc794wMcrMyFgsO1c4csBdowhpiqqwIyN_xjqI5z",
+        },
+    },
+}
